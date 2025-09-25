@@ -1,4 +1,4 @@
-# Roleplay Text to Speech Cross-Mod Compatibility Guide
+# Roleplay Text to Speech Cross-Mod API Compatibility Guide
 Hello and welcome to the cross-mod compatibility guide for RPTTS.<br>
 RPTTS is a simple mod in scope, and comes with a dedicated API that you can make use of through dynamic bindings (aka dynamic dispatch), this should make it trivial for most mods to support RPTTS.
 
@@ -17,7 +17,7 @@ public dynamic? RPTTSAPI; // Actual reference to RPTTS' API
 UsingRPTTS = api.ModLoader.IsModSystemEnabled("RPTTS.RPTTSAPI");
 if (UsingRPTTS) { RPTTSAPI = api.ModLoader.GetModSystem("RPTTS.RPTTSAPI"); }
 ```
-With this, you'll hyave a boolean to verify that RPTTS is present (and can gate logic based on that), as well as a reference to the API itself.<br>
+With this, you'll have a boolean to verify that RPTTS is present (and can gate logic based on that), as well as a reference to the API itself.<br>
 Now you can go straight to using RPTTS by calling our API. Simple, wasn't it?
 
 Keep in mind that if you screw up with a dynamic binding, it can cause crashes. Make sure you get the names right and gate logic appropriately.
