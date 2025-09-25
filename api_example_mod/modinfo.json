@@ -1,0 +1,9 @@
+{
+	"type": "code",
+	"modid": "rpttsapitest",
+	"name": "RPTTS API EXAMPLE",
+	"description": "Uninstall this from your game. Now.",
+	"version": "1.0.0",
+	"side": "Universal",
+	"requiredOnServer": false
+}
