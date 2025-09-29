@@ -17,6 +17,7 @@ namespace RPTTS
 		private TTSClientConfig UserConfig = null!;
 		private GuiDialogTTSSettings? SettingsDialogue;
 		private bool DebugMode = false;
+		public bool ExplicitCallsOnly = false; // Used to control our subscription to OnSendChatMessage
 
 		// Signal packages used as settings sync requests
 		[ProtoContract] public sealed class ShowSetupMsg	{ [ProtoMember(1)] public byte _ = 0; } // server -> client: Open settings once
@@ -40,9 +41,13 @@ namespace RPTTS
 			[ProtoMember(3)] public int VoiceId			{ get; set; }
 			[ProtoMember(4)] public float Pitch			{ get; set; }
 		}
-		private const int ServerRelayRadius = 200; // server-side envelope, clients still cull by HearingRange
+		public const int ServerRelayRadius = 200; // server-side envelope, clients still cull by HearingRange
 		private IClientNetworkChannel? ClientMessageChannel;
 		private IServerNetworkChannel? ServerMessageChannel;
+
+		// API read-only exposed variables
+		public bool APIDebugMode			=> DebugMode;
+		public KittenTTSEngine? APIEngine	=> VoiceSynthEngine;
 
 
 		public override bool ShouldLoad(EnumAppSide forSide) => forSide == EnumAppSide.Client || forSide == EnumAppSide.Server;
@@ -118,7 +123,6 @@ namespace RPTTS
 							$"Positional Refresh Rate = {VoiceSynthEngine.PositionRefreshRate}\n"			+
 							$"Hearing Distance = {VoiceSynthEngine.HearingRange:0.##}\n"					+
 							$"Audible Distance = {VoiceSynthEngine.TTSMaxDistance:0.##}\n"					+
-							$"Falloff Factor = {VoiceSynthEngine.TTSFallOffFactor:0.##}\n"					+
 							$"Speaker Count = {VoiceSynthEngine.GetSpeakerCount()}"							;
 						ClientAPI.ShowChatMessage(testlog);
 						
@@ -128,6 +132,25 @@ namespace RPTTS
 					{
 						ClientAPI?.ShowChatMessage("[rptts] [CRITICAL] ttstest failed: " + ex.Message);
 						return TextCommandResult.Error("[rptts] Critical error encountered! See log for details.");
+					}
+				}
+			);
+
+			// For toggling the subscription to OnSendChatMessage on/off, mostly for other mods to use
+			api.ChatCommands
+				.Create("ttsexplicit")
+				.WithDescription("Toggles whether tts should trigger whenever a player speaks, or only when explicitly requested by other mods")
+				.HandleWith(args =>
+				{
+					try
+					{
+						OverwriteChatSubscription(!ExplicitCallsOnly);
+						return TextCommandResult.Success();
+					}
+					catch (Exception ex)
+					{
+						ClientAPI?.ShowChatMessage("[rptts] [ERROR] ttsexplicit failed: " + ex.Message);
+						return TextCommandResult.Error("[rptts] Error when executing command! See log for details.");
 					}
 				}
 			);
@@ -187,7 +210,7 @@ namespace RPTTS
 		private void OnSendChatMessage(int groupId, ref string message, ref EnumHandling handled)
 		{
 			if (string.IsNullOrWhiteSpace(message) || ClientAPI == null) return;
-			if (message.StartsWith('/') || message.StartsWith('.')) return; // Ignore commands/console | Net8 char comparison instead of string
+			if (message.StartsWith('/') || message.StartsWith('.')) return; // Ignore commands/console
 
 			string toSpeak = message; // Copy ref param into a variable before using inside a lambda
 			if (DebugMode) { ClientAPI.Logger.Notification("[rptts] OnSendChatMessage: '{0}'", toSpeak); } // Keeps spam off the log if debug is disabled
@@ -363,11 +386,23 @@ namespace RPTTS
 				if (!serverplayer.WorldData.GetModData<bool>("rptts-setup-done", false))
 				{
 					serverplayer.WorldData.SetModData("rptts-setup-done", true);
-					serverplayer.BroadcastPlayerData();
 				}
 			}
 		}
 		#endregion
+
+		public void OverwriteChatSubscription(bool value)
+		{
+			if (ClientAPI == null) return;
+			ExplicitCallsOnly = value;
+
+			ClientAPI.Event.OnSendChatMessage -= OnSendChatMessage;
+			if (ExplicitCallsOnly) { ClientAPI.Event.OnSendChatMessage += OnSendChatMessage; }
+
+			string logmessage = "[rptts] Explicit calls is now set to: " + ExplicitCallsOnly;
+			ClientAPI.ShowChatMessage(logmessage);
+			ClientAPI.Logger.Notification(logmessage);
+		}
 
 		public override void Dispose()
 		{
