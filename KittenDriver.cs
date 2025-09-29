@@ -9,11 +9,11 @@ using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
-using Vintagestory.API.MathTools;
 using OpenTK.Audio.OpenAL;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Xml.Serialization;
+using VSSherpaOnnx;
 
 // OpenAL calls require a *current* AL context on the calling thread.
 // Otherwise, you’ll get access violations near world load.The thread doing AL calls should contain the current context.
@@ -31,9 +31,7 @@ namespace RPTTS
 
 		// Paths
 		private readonly string AssembliesDirectory;
-		private readonly string NativeDirectory;
 		private readonly string MLModelDirectory;
-		private readonly string ManagedSherpaPath;
 
 		// Reflection Caches
 		private Assembly?		SherpaAssembly;
@@ -57,6 +55,8 @@ namespace RPTTS
 			public long TickID;
 			public DateTime StartUTC;
 			public float ActivePitch = 1f;
+			public float ActiveGainMultiplier = 1f; // Used by other mods via API for shouting or whispering
+			public float ActiveFalloff = 1f; // API only, for increasing falloff range past 1f
 			public long LastPosUpdateMs = 0; // throttle position writes
 		}
 		private readonly List<SpeakerSlot> SpeakerSlotPool = new List<SpeakerSlot>();
@@ -75,9 +75,7 @@ namespace RPTTS
 		{
 			ClientAPI				= api;
 			AssembliesDirectory		= Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location)!;
-			NativeDirectory			= Path.Combine(AssembliesDirectory, "native");
 			MLModelDirectory		= Path.Combine(AssembliesDirectory, "models", "kitten-nano-en-v0_2-fp16");
-			ManagedSherpaPath		= Path.Combine(AssembliesDirectory, "sherpa-onnx.dll");
 		}
 
 		// Settings
@@ -86,7 +84,6 @@ namespace RPTTS
 		public float BaseTTSVolume		{ get; set; }	= 2f;
 		public float TTSZeroDistance					= 2f;	// Distance at which audio is 2D/max volume
 		public float TTSMaxDistance						= 35f;	// Max distance at which the audio can be heard
-		public float TTSFallOffFactor					= 1f;
 		public int LocalVoiceID			{ get; set; } 	= 0;
 		public float PlayerPitch		{ get; set; }	= 1f;
 		public bool HearSelf			{ get; set; } 	= true;
@@ -128,14 +125,11 @@ namespace RPTTS
 			// Chat messages sent fron code don't trigger OnSendChatMessage, so there's no risk of double speak.
 			ClientAPI.Logger.Notification("[rptts] Threads available: " + GetThreadCount() + " (out of " + Environment.ProcessorCount + ")");
 			ClientAPI.Logger.Notification("[rptts] Initialization sanity started: '" + InitializationGreeting + "'");
-			
-			ClientAPI.SendChatMessage(InitializationGreeting); // Send random greeting on spawn so the player knows that the TTS system works
 			Speak(InitializationGreeting, LocalVoiceID, PlayerPitch, null);
-			
 			ClientAPI.Logger.Notification("[rptts] Initialization sanity ended.");
 		}
 
-		public void Speak(string text, int voiceID, float pitch, string? speakerUID)
+		public void Speak(string text, int voiceID, float pitch, string? speakerUID, float? gainModifier = 1f, float? falloffModifier = 1f)
 		{
 			if (string.IsNullOrWhiteSpace(text)) return;
 			if (ForbidLongMessages == true && text.Length > 84) { text = ShortenedMessageBackups[MessageRNG.Next(ShortenedMessageBackups.Length)]; }
@@ -145,9 +139,11 @@ namespace RPTTS
 			// Note: We don't need to clamp the VoiceID as the model already graciously falls back on 0 if a value is invalid
 
 			SpeakerSlot slot = AcquireSlotFor(speakerUID);
-			slot.ActivePitch = pitch;
-			slot.StartUTC = DateTime.UtcNow;
-			slot.StreamEnded = false;
+			slot.ActivePitch				= pitch;
+			slot.ActiveGainMultiplier		= gainModifier ?? 1f;
+			slot.ActiveFalloff				= falloffModifier ?? 1f; // == HearingRange / customfalloff (so from 60 to 7.5 blocks)
+			slot.StartUTC					= DateTime.UtcNow;
+			slot.StreamEnded				= false;
 			slot.ChunkBuilder.Clear();
 			while (slot.StreamQueue.TryDequeue(out _)) {}
 			slot.SlotCancellationToken?.Cancel();
@@ -160,7 +156,8 @@ namespace RPTTS
 					"[rptts debug] " + "Recieved "
 					+ (text?.Length ?? 0) + "ch message from "
 					+ (speakerUID ?? "yourself") + " at "
-					+ pitch + " pitch with voice " + voiceID + "."
+					+ pitch + " pitch with voice " + voiceID + ". "
+					+ "Gain: " + gainModifier + ", Falloff: " + falloffModifier + "."
 				);
 			}
 
@@ -205,14 +202,9 @@ namespace RPTTS
 				{
 					// Validate files
 					if (!Directory.Exists(MLModelDirectory))	throw new DirectoryNotFoundException($"Kitten model directory not found: {MLModelDirectory}");
-					if (!File.Exists(ManagedSherpaPath))		throw new FileNotFoundException($"Managed Sherpa-ONNX not found: {ManagedSherpaPath}");
 
-					// Load natives
-					TryLoadNative(Path.Combine(NativeDirectory, "onnxruntime.dll"));
-					TryLoadNative(Path.Combine(NativeDirectory, "sherpa-onnx-c-api.dll"));
-
-					// Load managed wrapper
-					SherpaAssembly = AssemblyLoadContext.Default.LoadFromAssemblyPath(ManagedSherpaPath);
+					// Prepare natives & Load managed wrapper
+					SherpaAssembly = VSSherpaOnnxSystem.EnsureSherpaReady(ClientAPI);
 
 					TypeOfflineTTSKittenModelConfig		= SherpaAssembly.GetType("SherpaOnnx.OfflineTtsKittenModelConfig",	throwOnError: true);
 					TypeOfflineTTSModelConfig			= SherpaAssembly.GetType("SherpaOnnx.OfflineTtsModelConfig",		throwOnError: false);
@@ -277,12 +269,6 @@ namespace RPTTS
 			}
 			var targetplayer = ClientAPI.World?.AllPlayers?.FirstOrDefault(player => player.PlayerUID == uid);
 			return targetplayer?.Entity?.Pos?.XYZ;
-		}
-
-		private static void TryLoadNative(string fullPath)
-		{
-			try { if (File.Exists(fullPath)) NativeLibrary.Load(fullPath); }
-			catch { } // Sherpa should issue its own errors if this happens, though I don't know where it dumps them
 		}
 		
 		public int GetThreadCount()
@@ -462,15 +448,17 @@ namespace RPTTS
 				if (queued > 0) AL.SourcePlay(slot.Source);
 			}
 
-			// Update position at no higher rate than PositionRefreshRate, only if not local player
+			// Update position at no higher rate than PositionRefreshRate, and only if not local player
 			if (slot.SpeakerUID != null)
 			{
 				long currentMS = Environment.TickCount64;
 				if (currentMS - slot.LastPosUpdateMs >= PositionRefreshRate)
 				{
+					// Position Refresh
 					slot.LastPosUpdateMs = currentMS;
 					var speaker = GetSpeakerPosition(slot.SpeakerUID);
-					if (speaker == null)
+					var speakerplayer = ClientAPI.World?.AllPlayers?.FirstOrDefault(player => player.PlayerUID == slot.SpeakerUID)?.Entity;
+					if (speaker == null || speakerplayer == null || speakerplayer.Alive == false) // Lost track or player died
 					{
 						// Lost track of entity: stop audio and abort ongoing synthesis
 						StopSlotStream(slot);
@@ -480,33 +468,33 @@ namespace RPTTS
 					AL.Source(slot.Source, ALSource3f.Position, (float)speaker.X, (float)speaker.Y, (float)speaker.Z);
 
 					// Verbose Fall-off Debugging (commented out for performance) | Result: Everything works
-					if (RPTTSDebug && slot.SpeakerUID != null)
-					{
-						var debugspeaker = GetSpeakerPosition(slot.SpeakerUID);
-						var debuglocalplayer = ClientAPI.World?.Player?.Entity?.Pos?.XYZ;
+					// if (RPTTSDebug && slot.SpeakerUID != null)
+					// {
+					// 	var debugspeaker = GetSpeakerPosition(slot.SpeakerUID);
+					// 	var debuglocalplayer = ClientAPI.World?.Player?.Entity?.Pos?.XYZ;
 						
-						if (debugspeaker != null && debuglocalplayer != null)
-						{
-							double deltaX = debugspeaker.X - debuglocalplayer.X, deltaY = debugspeaker.Y - debuglocalplayer.Y, deltaZ = debugspeaker.Z - debuglocalplayer.Z;
-							double debugdistance = Math.Sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
+					// 	if (debugspeaker != null && debuglocalplayer != null)
+					// 	{
+					// 		double deltaX = debugspeaker.X - debuglocalplayer.X, deltaY = debugspeaker.Y - debuglocalplayer.Y, deltaZ = debugspeaker.Z - debuglocalplayer.Z;
+					// 		double debugdistance = Math.Sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
 
-							AL.GetSource(slot.Source, ALSource3f.Position, out float speakerX, out float speakerY, out float speakerZ);
-							AL.GetListener(ALListener3f.Position, out float listenerX, out float listenerY, out float listenerZ);
+					// 		AL.GetSource(slot.Source, ALSource3f.Position, out float speakerX, out float speakerY, out float speakerZ);
+					// 		AL.GetListener(ALListener3f.Position, out float listenerX, out float listenerY, out float listenerZ);
 
-							int debugdistancemodel = AL.Get(ALGetInteger.DistanceModel);
-							AL.GetSource(slot.Source, ALSourceb.SourceRelative, out bool debugrelative);
+					// 		int debugdistancemodel = AL.Get(ALGetInteger.DistanceModel);
+					// 		AL.GetSource(slot.Source, ALSourceb.SourceRelative, out bool debugrelative);
 
-							ShowChatMessageOnMainThread
-							(
-								"===[" + slot.SpeakerUID + "'s message falloff]===\n"					+
-								$"Distance: {debugdistance:0.##}\n"										+
-								$"Cutoff: {(TTSMaxDistance - debugdistance):0.##}\n"					+
-								$"Speaker: ({speakerX:0.##}, {speakerY:0.##}, {speakerZ:0.##})\n"		+
-								$"Listener: ({listenerX:0.##}, {listenerY:0.##}, {listenerZ:0.##})\n"	+
-								$"Model: {debugdistancemodel} (Relative: {debugrelative}, Should be: False)"
-							);
-						}
-					}
+					// 		ShowChatMessageOnMainThread
+					// 		(
+					// 			"===[" + slot.SpeakerUID + "'s message falloff]===\n"					+
+					// 			$"Distance: {debugdistance:0.##}\n"										+
+					// 			$"Cutoff: {(TTSMaxDistance - debugdistance):0.##}\n"					+
+					// 			$"Speaker: ({speakerX:0.##}, {speakerY:0.##}, {speakerZ:0.##})\n"		+
+					// 			$"Listener: ({listenerX:0.##}, {listenerY:0.##}, {listenerZ:0.##})\n"	+
+					// 			$"Model: {debugdistancemodel} (Relative: {debugrelative}, Should be: False)"
+					// 		);
+					// 	}
+					// }
 				}
 			}
 
@@ -611,7 +599,7 @@ namespace RPTTS
 				var chunkbuffer = slot.ChunkBuilder;
 				for (int i = 0; i < samplecount; i++)
 				{
-					float v = floatbuffer[i] * BaseTTSVolume;
+					float v = (floatbuffer[i] * slot.ActiveGainMultiplier) * BaseTTSVolume;
 					if (v > 1f) v = 1f; else if (v < -1f) v = -1f;
 					chunkbuffer.Add((short)MathF.Round(v * short.MaxValue));
 					if (chunkbuffer.Count >= StreamChunkSamples)
@@ -641,7 +629,7 @@ namespace RPTTS
 			AL.Source(slot.Source, ALSourcef.MaxDistance, TTSMaxDistance);
 			AL.Source(slot.Source, ALSourcef.MinGain, 0f); // Required for falloff to work
 			AL.Source(slot.Source, ALSourcef.MaxGain, 1f); // Required for falloff to work
-			AL.Source(slot.Source, ALSourcef.RolloffFactor, islocalplayer ? 0f : TTSFallOffFactor);
+			AL.Source(slot.Source, ALSourcef.RolloffFactor, islocalplayer ? 0f : slot.ActiveFalloff);
 			AL.Enable((ALCapability)AL.GetEnumValue("AL_SOURCE_DISTANCE_MODEL")); // Explicitly enable the source distance model
 			AL.Source(slot.Source, (ALSourcei)0xD000, (int)ALDistanceModel.LinearDistanceClamped); // Independent distance model to ensure 1-0 falloff
 
