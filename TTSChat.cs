@@ -26,6 +26,10 @@ namespace RPTTS
 		private IClientNetworkChannel? ClientNetworkChannel;
 		private IServerNetworkChannel? ServerNetworkChannel;
 
+		// Used for kicking players via the mod to auto-reload the mod on server leave and re-join
+		[ProtoContract] public sealed class ServerKickRequest { [ProtoMember(1)] public string Reason = ""; }
+		private IServerNetworkChannel? ServerUtilitiesChannel;
+
 		// TTS Network Relay
 		[ProtoContract] public sealed class SpeakRequest // Client -> Server
 		{
@@ -65,6 +69,10 @@ namespace RPTTS
 				.RegisterChannel("rptts-speak")
 				.RegisterMessageType<SpeakRequest>()
 				.RegisterMessageType<SpeakEvent>();
+
+			api.Network
+                .RegisterChannel("rptts-utils")
+                .RegisterMessageType<ServerKickRequest>();
 		}
 
 		#region Client
@@ -72,6 +80,33 @@ namespace RPTTS
 		{
 			ClientAPI = api;
 			UserConfig = api.LoadModConfig<TTSClientConfig>("rptts_settings.json") ?? new TTSClientConfig();
+
+			if (UserConfig.ModEnabled == false)
+			{
+				api.ChatCommands
+					.Create("rptts")
+					.WithDescription("Re-enable RPTTS and exit the server for the changes to take place.")
+					.HandleWith(args =>
+					{
+						ClientAPI.ShowChatMessage("Leaving server so the mod can be re-loaded...");
+
+						UserConfig.ModEnabled = true;
+						api.StoreModConfig(UserConfig, "rptts_settings.json");
+						ClientAPI.ModLoader.GetModSystem<TTSChatSystem>().RequestRemovalFromServer(ClientAPI, Lang.Get("rptts:Error-ModKickReason"));
+
+						return TextCommandResult.Success();
+					}
+				);
+				
+				// The mod is 'disabled' but it still needs to listen in and relay messages to the server so it works for others
+				ClientMessageChannel = api.Network.GetChannel("rptts-speak"); // Assign but don't register (subscribe to) the speak channel
+				ClientAPI.Event.OnSendChatMessage += OnSendChatMessageServerDirect;
+				ClientAPI.Logger.Notification("[rptts] TTS Chat System initiated in disabled mode (critical functionality only)!");
+				ClientAPI.ShowChatMessage(Lang.Get("rptts:Error-ModDisabledReminder"));
+
+				return; // Early out, cancel the mod from loading further. The KittenDriver is never loaded into memory.
+			}
+			
 			
 			// Registering a command for opening the tts settings window
 			api.ChatCommands
@@ -169,7 +204,7 @@ namespace RPTTS
 			};
 
 			ClientAPI.Event.OnSendChatMessage		+= OnSendChatMessage;	// Called whenever a player sends a message (local only for now)
-			ClientAPI.Event.LevelFinalize			+= OnLevelFinalize;		// Called when the player loads into a world
+			ClientAPI.Event.PlayerEntitySpawn		+= OnPlayerEntitySpawn;		// Called when the player loads into a world
 
 			// Network: setup client channels & handlers
 			ClientNetworkChannel = api.Network
@@ -183,12 +218,20 @@ namespace RPTTS
 			ClientAPI.Logger.Notification("[rptts] TTS Chat System initiated!");
 		}
 
-		private void OnLevelFinalize()
+		private void OnPlayerEntitySpawn(IClientPlayer spawnedPlayer)
 		{
+			if (ClientAPI == null || spawnedPlayer.PlayerUID != ClientAPI.World?.Player?.PlayerUID) return;
 			if (SanityCheckScheduled) { return; } SanityCheckScheduled = true;
 			if (UserConfig.MaxIdleModels > 8) { ClientAPI!.ShowChatMessage(Lang.Get("rptts:Error-StartupSpeakerCountWarn", UserConfig.MaxIdleModels * 25)); }
 
-			ClientAPI!.Logger.Notification("[rptts] LevelFinalize happened, scheduling initialization sanity check.");
+			ClientAPI!.Logger.Notification("[rptts] PlayerEntitySpawn happened, scheduling initialization sanity check.");
+
+			// Initiate handshake with server to check first-time set-up status
+			ClientAPI.Event.EnqueueMainThreadTask(() =>
+			{
+				try { ClientNetworkChannel?.SendPacket(new SetupPingMsg()); }
+				catch (Exception ex) { ClientAPI.Logger.Warning("[rptts] [CRITICAL] SetupPing failed to send: {0}", ex); }
+			}, "rptts-setup-ping-after-spawn");
 
 			// Delay a bit so audio + player entity are fully ready
 			ClientAPI.Event.RegisterCallback(_ =>
@@ -200,14 +243,13 @@ namespace RPTTS
 					VoiceSynthEngine.InitializationGreet();
 				}
 				catch (Exception ex) { ClientAPI.Logger.Warning("[rptts] [CRITICAL] Initialization sanity check failed: {0}", ex); }
-
-				try { ClientNetworkChannel?.SendPacket(new SetupPingMsg()); }
-				catch (Exception ex) { ClientAPI.Logger.Warning("[rptts] [CRITICAL] SetupPing failed to send: {0}", ex); }
 			}, 2500); // If we try to trigger our TTS too early, it'll cause a crash. We need to wait for the player and audio system to initialize in the world.
+
+			ClientAPI.Event.PlayerEntitySpawn -= OnPlayerEntitySpawn; // Ignore future requests from irrelevant players
 		}
 
 		// Outgoing chat message sent by player
-		private void OnSendChatMessage(int groupId, ref string message, ref EnumHandling handled)
+		private void OnSendChatMessage(int groupId, ref string message, ref EnumHandling handled) // group ID is used for filtering in the rpttsfiltering mod add-on
 		{
 			if (string.IsNullOrWhiteSpace(message) || ClientAPI == null) return;
 			if (message.StartsWith('/') || message.StartsWith('.')) return; // Ignore commands/console
@@ -244,6 +286,20 @@ namespace RPTTS
 				}
 				catch (Exception ex) { ClientAPI.Logger.Warning("[rptts] [CRITICAL] Speak (send message) failed: {0}", ex); }
 			}, "rptts-speak-send");
+		}
+
+		private void OnSendChatMessageServerDirect(int groupId, ref string message, ref EnumHandling handled) // For when the mod is disabled
+		{
+			if (string.IsNullOrWhiteSpace(message) || ClientAPI == null) return;
+			if (message.StartsWith('/') || message.StartsWith('.')) return;
+
+			string toRelay = message;
+			ClientMessageChannel?.SendPacket(new SpeakRequest
+			{
+				Text		= toRelay,
+				VoiceId		= UserConfig.VoiceID,
+				Pitch		= UserConfig.PlayerPitch
+			});
 		}
 
 		// Incoming relay from server (nearby speaker)
@@ -288,11 +344,12 @@ namespace RPTTS
 				OpenTTSSettings();
 				ClientNetworkChannel?.SendPacket(new SetupAckMsg());
 				ClientAPI?.Logger.Notification("[rptts] Setup dialog shown & ACK-nowledgement was sent back");
-			}, 50);
+			}, 50); // Keeping this as a memento of sorts
 			
-			// We're using a RegisterCallback not for the actual time delay (that'd be very dirty!), but rather because this timer
-			// only starts after the player properly spawns into the world. Which is something you can't reliably check for directly even with events.
-			// Not without a lot of messy and inefficient code. So paradoxically, this callback is the cleanest and most performant approach.
+			// Callback MS only start after player creation, meaning that we can expect a callback with a delay to always
+			// arrive after the player has been created. Except in a multiplayer enviroment,
+			// where the ms counter starts as soon as the server does. To fix this, we're now explicitly having the client
+			// initiate the handshake for the server to call back on. Hopefully this eliminates any race conditions.
 		}
 
 		private void OpenTTSSettings()
@@ -322,6 +379,14 @@ namespace RPTTS
 			}
 
 			ClientAPI!.StoreModConfig(UserConfig, "rptts_settings.json");
+		}
+
+		public void RequestRemovalFromServer(ICoreClientAPI OwnerClientAPI, string GivenReason)
+		{
+			if (OwnerClientAPI == null || OwnerClientAPI.World == null) return;
+
+            var channel = OwnerClientAPI.Network.GetChannel("rptts-utils");
+            channel.SendPacket(new ServerKickRequest{ Reason = GivenReason});
 		}
 		#endregion
 
@@ -369,14 +434,9 @@ namespace RPTTS
 				}
 			);
 
-			ServerAPI.Logger.Notification("[rptts] TTS Chat System initiated on Server.");
-			ServerAPI.Event.PlayerNowPlaying += OnPlayerNowPlaying;
-		}
+			ServerUtilitiesChannel = ServerAPI.Network.GetChannel("rptts-utils").SetMessageHandler<ServerKickRequest>(OnKickRequest);
 
-		private void OnPlayerNowPlaying(IServerPlayer player)
-		{
-			bool seen = player.WorldData.GetModData<bool>("rptts-setup-done", false);
-			if (!seen) ServerNetworkChannel?.SendPacket(new ShowSetupMsg(), player); // Fire the setup dialog once for this player in this save
+			ServerAPI.Logger.Notification("[rptts] TTS Chat System initiated on Server.");
 		}
 
 		private void OnSetupAck(IPlayer fromPlayer, SetupAckMsg _)
@@ -389,6 +449,8 @@ namespace RPTTS
 				}
 			}
 		}
+
+		private void OnKickRequest(IServerPlayer fromPlayer, ServerKickRequest packet) { fromPlayer.Disconnect(packet.Reason); }
 		#endregion
 
 		public void OverwriteChatSubscription(bool value)
@@ -406,8 +468,9 @@ namespace RPTTS
 
 		public override void Dispose()
 		{
-			try { if (ClientAPI != null)	ClientAPI.Event.OnSendChatMessage	-= OnSendChatMessage; }		catch { }
-			try { if (ClientAPI != null)	ClientAPI.Event.LevelFinalize		-= OnLevelFinalize; }		catch { }
+			try { if (ClientAPI != null)	ClientAPI.Event.OnSendChatMessage	-= OnSendChatMessage; }					catch { }
+			try { if (ClientAPI != null)	ClientAPI.Event.OnSendChatMessage	-= OnSendChatMessageServerDirect; }		catch { }
+			try { if (ClientAPI != null)	ClientAPI.Event.PlayerEntitySpawn	-= OnPlayerEntitySpawn; }				catch { }
 			try { VoiceSynthEngine?.Dispose(); } catch { }
 		}
 	}
