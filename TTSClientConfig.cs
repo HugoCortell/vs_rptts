@@ -6,6 +6,7 @@ using Vintagestory.API.Config;
 
 public class TTSClientConfig
 {
+	public bool		ModEnabled = true; // Used for aborting core code from executing, while keeping the actual mod alive
 	public float	BaseTTSVolume = 2f; // Clamp should be 0.5f to 3.5f
 	public int		PositionRefreshRate = 500;
 	public bool		AvoidLongMessages = false;
@@ -46,6 +47,7 @@ namespace RPTTS
 			this.OnSaveSettings		= OnSave;
 
 			SettingsDraft = new TTSClientConfig {
+				ModEnabled			= UserConfig.ModEnabled,
 				BaseTTSVolume		= GameMath.Clamp(UserConfig.BaseTTSVolume, 0.5f, 3.5f),
 				PositionRefreshRate	= GameMath.Clamp(UserConfig.PositionRefreshRate, 50, 2000),
 				AvoidLongMessages	= UserConfig.AvoidLongMessages,
@@ -77,6 +79,7 @@ namespace RPTTS
 			if (IsOpened()) return true;
 
 			SettingsDraft = new TTSClientConfig { // Re-seed the draft values when the window opens
+				ModEnabled							= UserConfigReference.ModEnabled,
 				BaseTTSVolume						= GameMath.Clamp(UserConfigReference.BaseTTSVolume, 0.5f, 3.5f),
 				PositionRefreshRate					= GameMath.Clamp(UserConfigReference.PositionRefreshRate, 50, 2000),
 				AvoidLongMessages					= UserConfigReference.AvoidLongMessages,
@@ -156,6 +159,7 @@ namespace RPTTS
 			var ButtonSaveConfig	= ElementBounds.Fixed(x + 10, y + 14, 120, 26);
 			var ButtonResetConfig	= ElementBounds.Fixed(x + 140, y + 14, 120, 26);
 			var ButtonCancelConfig	= ElementBounds.Fixed(x + 270, y + 14, 120, 26);
+			var ButtonDisableMod	= ElementBounds.Fixed(x + 400, y + 14, 180, 26);
 
 			BackgroundBounds.WithChildren(
 				DescriptionBox, DescriptionTextBox,
@@ -166,7 +170,7 @@ namespace RPTTS
 				
 				VoiceSelectionBox, VoiceSelectionLabel, VoiceSelectPrev, VoiceName, VoiceSelectionNext,
 				
-				ConfigActionsBox, ButtonSaveConfig, ButtonResetConfig, ButtonCancelConfig
+				ConfigActionsBox, ButtonSaveConfig, ButtonResetConfig, ButtonCancelConfig, ButtonDisableMod
 			);
 
 			var FontBody		= CairoFont.WhiteSmallishText();
@@ -225,6 +229,7 @@ namespace RPTTS
 					.AddButton(Lang.Get("general-save"), OnSave, ButtonSaveConfig)
 					.AddButton(Lang.Get("rptts:GUI-ResetButton"), OnReset, ButtonResetConfig)
 					.AddButton(Lang.Get("general-cancel"), OnCancel, ButtonCancelConfig)
+					.AddButton(Lang.Get("rptts:GUI-DisableMod"), OnDisableModRequest, ButtonDisableMod)
 
 				.EndChildElements()
 				.Compose();
@@ -351,6 +356,19 @@ namespace RPTTS
 				OriginalCPUMode, OriginalHearSelf, OriginalMaxModels
 			);
 			TryClose(); return true;
+		}
+
+		private bool OnDisableModRequest()
+		{
+			TryClose();
+			new GuiDialogConfirmDisableMod(capi, OnDisableModConfirmed).TryOpen();
+			return true;
+		}
+
+		private void OnDisableModConfirmed()
+		{
+			UserConfigReference.ModEnabled = false; OnSaveSettings?.Invoke(UserConfigReference);
+			capi.ModLoader.GetModSystem<TTSChatSystem>().RequestRemovalFromServer(capi, Lang.Get("rptts:Error-ModKickReason"));
 		}
 
 		private void OnTitleBarClose() => OnCancel();
@@ -510,4 +528,76 @@ namespace RPTTS
 		}
 		#endregion
 	}
+
+	#region Confirmation Window
+	public class GuiDialogConfirmDisableMod : GuiDialog
+	{
+		private readonly Action OnConfirmDisable;
+
+		public GuiDialogConfirmDisableMod(ICoreClientAPI capi, Action onConfirmDisable) : base(capi)
+		{
+			OnConfirmDisable = onConfirmDisable ?? throw new ArgumentNullException(nameof(onConfirmDisable));
+			ComposeDialog();
+		}
+
+		public override string ToggleKeyCombinationCode => null!;
+
+		private void ComposeDialog()
+		{
+			var DialogueBounds = ElementStdBounds.AutosizedMainDialog.WithAlignment(EnumDialogArea.CenterMiddle);
+
+			var BackgroundBounds = ElementBounds.Fill.WithFixedPadding(GuiStyle.ElementToDialogPadding);
+			BackgroundBounds.BothSizing = ElementSizing.FitToChildren;
+
+			int x = 20;
+			int w = 620;
+			int y = (int)(GuiStyle.TitleBarHeight + 10);
+
+			// Card 1: Body
+			var BodyBox			= ElementBounds.Fixed(x, y, w, 110);
+			var BodyTextBox		= ElementBounds.Fixed(x + 10, y + 10, w - 20, 100);
+			y += 110 + 10;
+
+			// Card 2: Buttons
+			var ActionsBox		= ElementBounds.Fixed(x, y, w, 58);
+			var ButtonConfirm	= ElementBounds.Fixed(x + 10, y + 14, 160, 26);
+			var ButtonReturn	= ElementBounds.Fixed(x + 180, y + 14, 160, 26);
+
+			BackgroundBounds.WithChildren(BodyBox, BodyTextBox, ActionsBox, ButtonConfirm, ButtonReturn);
+
+			var FontBody = CairoFont.WhiteSmallishText();
+
+			SingleComposer = capi.Gui
+				.CreateCompo("rptts-confirm-disable", DialogueBounds)
+				.AddDialogBG(BackgroundBounds, true)
+				.AddDialogTitleBar(Lang.Get("restart-title"), OnTitleBarClose)
+				.BeginChildElements(BackgroundBounds)
+
+					.AddInset(BodyBox, 3)
+					.AddRichtext(Lang.Get("rptts:GUI-DisableModDialogue"), CairoFont.WhiteDetailText(), BodyTextBox, "confirmBody")
+
+					.AddInset(ActionsBox, 3)
+					.AddButton(Lang.Get("Confirm"), OnConfirm, ButtonConfirm)
+					.AddButton(Lang.Get("general-cancel"), OnReturn, ButtonReturn)
+
+				.EndChildElements()
+				.Compose();
+		}
+
+		private bool OnConfirm()
+		{
+			OnConfirmDisable.Invoke();
+			TryClose();
+			return true;
+		}
+
+		private bool OnReturn()
+		{
+			TryClose();
+			return true;
+		}
+
+		private void OnTitleBarClose() => OnReturn();
+	}
+	#endregion
 }
